@@ -191,13 +191,14 @@ dput_out:
 	return retval;
 }
 
+/*user_path_at(AT_FDCWD, name, LOOKUP_FOLLOW, path)*/
 int user_path_at(int dfd, const char __user *name, unsigned flags,
 		 struct path *path)
 {
 	return user_path_at_empty(dfd, name, flags, path, NULL);
 }
 
-/*flags=LOOKUP_FOLLOW empty=NULL*/
+/*flags=LOOKUP_FOLLOW empty=NULL  name:mountpoint dir name*/
 int user_path_at_empty(int dfd, const char __user *name, unsigned flags,
 		 struct path *path, int *empty)
 {
@@ -261,7 +262,7 @@ error:
 static int filename_lookup(int dfd, struct filename *name,
 				unsigned int flags, struct nameidata *nd)
 {
-	/*flags添加LOOKUP_RCU*/
+	/*flags添加LOOKUP_RCU name->nam:文件夹的名称  */
 	int retval = path_lookupat(dfd, name->name, flags | LOOKUP_RCU, nd);
 	if (unlikely(retval == -ECHILD))
 		retval = path_lookupat(dfd, name->name, flags, nd);
@@ -485,6 +486,7 @@ static int link_path_walk(const char *name, struct nameidata *nd)
 				type = LAST_DOT;
 		}
 		if (likely(type == LAST_NORM)) {
+			/*刚开始nd->path = nd.root当前进程的根目录*/
 			struct dentry *parent = nd->path.dentry;
 			nd->flags &= ~LOOKUP_JUMPED;
 			if (unlikely(parent->d_flags & DCACHE_OP_HASH)) {
@@ -542,6 +544,7 @@ static inline int walk_component(struct nameidata *nd, struct path *path,
 	 * to be able to know about the current root directory and
 	 * parent relationships.
 	 */
+	/*为简单起见，我们认为分析的路径中不包含.或者..*/
 	if (unlikely(nd->last_type != LAST_NORM))
 		return handle_dots(nd, nd->last_type);
 	/*先快速查找，如果找不到在执行lookup_slow
@@ -582,5 +585,183 @@ out_path_put:
 out_err:
 	terminate_walk(nd);
 	return err;
+}
+
+/*
+ *  It's more convoluted than I'd like it to be, but... it's still fairly
+ *  small and for now I'd prefer to have fast path as straight as possible.
+ *  It _is_ time-critical.
+ */
+static int lookup_fast(struct nameidata *nd,
+		       struct path *path, struct inode **inode)
+{
+	struct vfsmount *mnt = nd->path.mnt;
+	struct dentry *dentry, *parent = nd->path.dentry;
+	int need_reval = 1;
+	int status = 1;
+	int err;
+
+	/*
+	 * Rename seqlock is not required here because in the off chance
+	 * of a false negative due to a concurrent rename, we're going to
+	 * do the non-racy lookup, below.
+	 */
+	if (nd->flags & LOOKUP_RCU) {
+		unsigned seq;
+		dentry = __d_lookup_rcu(parent, &nd->last, &seq);
+		if (!dentry)
+			goto unlazy;
+
+		/*
+		 * This sequence count validates that the inode matches
+		 * the dentry name information from lookup.
+		 */
+		*inode = dentry->d_inode;
+		if (read_seqcount_retry(&dentry->d_seq, seq))
+			return -ECHILD;
+
+		/*
+		 * This sequence count validates that the parent had no
+		 * changes while we did the lookup of the dentry above.
+		 *
+		 * The memory barrier in read_seqcount_begin of child is
+		 *  enough, we can use __read_seqcount_retry here.
+		 */
+		if (__read_seqcount_retry(&parent->d_seq, nd->seq))
+			return -ECHILD;
+		nd->seq = seq;
+
+		if (unlikely(dentry->d_flags & DCACHE_OP_REVALIDATE)) {
+			status = d_revalidate(dentry, nd->flags);
+			if (unlikely(status <= 0)) {
+				if (status != -ECHILD)
+					need_reval = 0;
+				goto unlazy;
+			}
+		}
+		path->mnt = mnt;
+		path->dentry = dentry;/*path的dentry赋值为找到的dentry*/
+		if (likely(__follow_mount_rcu(nd, path, inode)))
+			return 0;
+unlazy:
+		if (unlazy_walk(nd, dentry))
+			return -ECHILD;
+	} else {
+		dentry = __d_lookup(parent, &nd->last);
+	}
+
+	if (unlikely(!dentry))
+		goto need_lookup;
+
+	if (unlikely(dentry->d_flags & DCACHE_OP_REVALIDATE) && need_reval)
+		status = d_revalidate(dentry, nd->flags);
+	if (unlikely(status <= 0)) {
+		if (status < 0) {
+			dput(dentry);
+			return status;
+		}
+		d_invalidate(dentry);
+		dput(dentry);
+		goto need_lookup;
+	}
+
+	path->mnt = mnt;
+	path->dentry = dentry;
+	err = follow_managed(path, nd->flags);
+	if (unlikely(err < 0)) {
+		path_put_conditional(path, nd);
+		return err;
+	}
+	if (err)
+		nd->flags |= LOOKUP_JUMPED;
+	*inode = path->dentry->d_inode;
+	return 0;
+
+need_lookup:
+	return 1;
+}
+
+struct dentry *__d_lookup_rcu(const struct dentry *parent,
+				const struct qstr *name,
+				unsigned *seqp)
+{
+	u64 hashlen = name->hash_len;
+	const unsigned char *str = name->name;
+	struct hlist_bl_head *b = d_hash(parent, hashlen_hash(hashlen));
+	struct hlist_bl_node *node;
+	struct dentry *dentry;
+
+	/*
+	 * Note: There is significant duplication with __d_lookup_rcu which is
+	 * required to prevent single threaded performance regressions
+	 * especially on architectures where smp_rmb (in seqcounts) are costly.
+	 * Keep the two functions in sync.
+	 */
+
+	/*
+	 * The hash list is protected using RCU.
+	 *
+	 * Carefully use d_seq when comparing a candidate dentry, to avoid
+	 * races with d_move().
+	 *
+	 * It is possible that concurrent renames can mess up our list
+	 * walk here and result in missing our dentry, resulting in the
+	 * false-negative result. d_lookup() protects against concurrent
+	 * renames using rename_lock seqlock.
+	 *
+	 * See Documentation/filesystems/path-lookup.txt for more details.
+	 */
+	hlist_bl_for_each_entry_rcu(dentry, node, b, d_hash) {
+		unsigned seq;
+	
+seqretry:/*在hlist中寻找有没有缓存的dentry和我么正在寻找的匹配*/
+		/*
+		 * The dentry sequence count protects us from concurrent
+		 * renames, and thus protects parent and name fields.
+		 *
+		 * The caller must perform a seqcount check in order
+		 * to do anything useful with the returned dentry.
+		 *
+		 * NOTE! We do a "raw" seqcount_begin here. That means that
+		 * we don't wait for the sequence count to stabilize if it
+		 * is in the middle of a sequence change. If we do the slow
+		 * dentry compare, we will do seqretries until it is stable,
+		 * and if we end up with a successful lookup, we actually
+		 * want to exit RCU lookup anyway.
+		 */
+		seq = raw_seqcount_begin(&dentry->d_seq);
+		if (dentry->d_parent != parent)
+			continue;
+		if (d_unhashed(dentry))
+			continue;
+
+		if (unlikely(parent->d_flags & DCACHE_OP_COMPARE)) {
+			if (dentry->d_name.hash != hashlen_hash(hashlen))
+				continue;
+			*seqp = seq;
+			switch (slow_dentry_cmp(parent, dentry, seq, name)) {
+			case D_COMP_OK:
+				return dentry;
+			case D_COMP_NOMATCH:
+				continue;
+			default:
+				goto seqretry;
+			}
+		}
+
+		if (dentry->d_name.hash_len != hashlen)
+			continue;
+		*seqp = seq;
+		if (!dentry_cmp(dentry, str, hashlen_len(hashlen)))
+			return dentry;
+	}
+	return NULL;
+}
+
+static inline struct hlist_bl_head *d_hash(const struct dentry *parent,
+					unsigned int hash)
+{
+	hash += (unsigned long) parent / L1_CACHE_BYTES;
+	return dentry_hashtable + hash_32(hash, d_hash_shift);
 }
 
