@@ -503,7 +503,7 @@ static int link_path_walk(const char *name, struct nameidata *nd)
 		nd->last.name = name;
 		nd->last_type = type;
 
-		name += hashlen_len(hash_len);
+		name += hashlen_len(hash_len);/*对于/sys这样的路径，在该地方就返回了*/
 		if (!*name)
 			return 0;
 		/*

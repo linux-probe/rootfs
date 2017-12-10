@@ -1,11 +1,16 @@
 /*start_kernel-->vfs_caches_init*/
 
+struct path {
+	struct vfsmount *mnt;
+	struct dentry *dentry;
+};
+
+
 struct vfsmount {
 	struct dentry *mnt_root;	/* root of the mounted tree */
 	struct super_block *mnt_sb;	/* pointer to superblock */
 	int mnt_flags;
 };
-
 
 struct mount {
 	struct hlist_node mnt_hash;
@@ -247,7 +252,9 @@ retry:
 
 	s->s_type = type;
 	strlcpy(s->s_id, type->name, sizeof(s->s_id));
+	/*添加到全局链表 super_blocks 中*/
 	list_add_tail(&s->s_list, &super_blocks);
+	/*添加到filesystem的哈希链表中*/
 	hlist_add_head(&s->s_instances, &type->fs_supers);
 	spin_unlock(&sb_lock);
 	get_filesystem(type);
@@ -280,7 +287,7 @@ struct dentry *mount_nodev(struct file_system_type *fs_type,
 	int error;
 	struct super_block *s = sget(fs_type, NULL, set_anon_super, flags, NULL);
 
-	/*调用shmem_fill_super*/
+	/*调用 shmem_fill_super */
 	error = fill_super(s, data, flags & MS_SILENT ? 1 : 0);
 
 	s->s_flags |= MS_ACTIVE;
@@ -483,7 +490,7 @@ static struct inode *shmem_get_inode(struct super_block *sb, const struct inode 
 			mpol_shared_policy_init(&info->policy,
 						 shmem_get_sbmpol(sbinfo));
 			break;
-		case S_IFDIR:
+		case S_IFDIR:/*本次分析的mode为该项*/
 			inc_nlink(inode);
 			/* Some things misbehave if size == 0 on a directory */
 			inode->i_size = 2 * BOGO_DIRENT_SIZE;
@@ -703,6 +710,7 @@ int shmem_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_blocksize = PAGE_CACHE_SIZE;
 	sb->s_blocksize_bits = PAGE_CACHE_SHIFT;
 	sb->s_magic = TMPFS_MAGIC;
+	/*重新赋值 super_operations */
 	sb->s_op = &shmem_ops;
 	sb->s_time_gran = 1;
 #ifdef CONFIG_TMPFS_XATTR
@@ -791,8 +799,8 @@ static void __init init_mount_tree(void)
 	init_task.nsproxy->mnt_ns = ns;
 	get_mnt_ns(ns);
 
-	root.mnt = mnt;
-	root.dentry = mnt->mnt_root;
+	root.mnt = mnt;/*指向自己*/
+	root.dentry = mnt->mnt_root;/*指向自己*/
 	mnt->mnt_flags |= MNT_LOCKED;
 
 	set_fs_pwd(current->fs, &root);
@@ -875,7 +883,7 @@ mount_fs(struct file_system_type *type, int flags, const char *name, void *data)
 	char *secdata = NULL;
 	int error = -ENOMEM;
 
-	/*调用rootfs mount函数*/
+	/*调用rootfs mount函数 rootfs_mount*/
 	root = type->mount(type, flags, name, data);
 	sb = root->d_sb;
 	BUG_ON(!sb);
