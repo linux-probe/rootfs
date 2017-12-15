@@ -48,3 +48,73 @@ struct path {
 
 在path中dentry最终指向需要寻找的文件的dentry，而mnt间接的指向该文件所在文件系统的挂载信息struct mount，进而得到挂载点等信息。
 
+#### debugfs挂载过程
+
+在debugfs还没有在用户空间执行mount命令进行挂载的时候，在内核初始化的时候，就有很多驱动程序要用了，需要怎么处理了，下面是regulator_init中的例子（在分析的系统中，是第一个使用degbugfs系统的）
+
+##### regulator_init
+
+```c
+static int __init regulator_init(void)
+{
+	ret = class_register(&regulator_class);
+	debugfs_root = debugfs_create_dir("regulator", NULL);
+	debugfs_create_file("supply_map", 0444, debugfs_root, NULL,
+			    &supply_map_fops);
+	......
+}
+```
+##### debugfs_create_dir
+```c
+struct dentry *debugfs_create_dir(const char *name, struct dentry *parent)
+{
+	struct dentry *dentry = start_creating(name, parent);
+	struct inode *inode;
+	inode = debugfs_get_inode(dentry->d_sb);
+	inode->i_mode = S_IFDIR | S_IRWXU | S_IRUGO | S_IXUGO;
+	inode->i_op = &simple_dir_inode_operations;
+	inode->i_fop = &simple_dir_operations;
+
+	/* directory inodes start off with i_nlink == 2 (for "." entry) */
+	inc_nlink(inode);
+	d_instantiate(dentry, inode);
+	inc_nlink(dentry->d_parent->d_inode);
+	fsnotify_mkdir(dentry->d_parent->d_inode, dentry);
+	return end_creating(dentry);
+}
+```
+##### start_creating
+```c
+static struct dentry *start_creating(const char *name, struct dentry *parent)
+{
+	struct dentry *dentry;
+	int error;
+	error = simple_pin_fs(&debug_fs_type, &debugfs_mount, &debugfs_mount_count);
+	if (!parent)
+		parent = debugfs_mount->mnt_root;
+	mutex_lock(&parent->d_inode->i_mutex);
+	dentry = lookup_one_len(name, parent, strlen(name));
+	return dentry;
+}
+```
+
+##### simple_pin_fs
+
+```c
+int simple_pin_fs(struct file_system_type *type, struct vfsmount **mount, int *count)
+{
+	struct vfsmount *mnt = NULL;
+	mnt = vfs_kern_mount(type, MS_KERNMOUNT, type->name, NULL);
+	*mount = mnt;
+}
+```
+
+simple_pin_fs会调用vfs_kern_mount，但是于从user空间调用mount命令不同，kernel调用时flags参数为
+
+**MS_KERNMOUNT** 。
+
+调用vfs_kern_mount之后，就已经分配了根super_block，并且会执行hlist_add_head(&s->s_instances, &type->fs_supers);将super_block的s_instances加入filesystem_type的哈希链表fs_supers中。后面在挂载的时候，检查已经存在就不用在分配。
+
+
+
+   
