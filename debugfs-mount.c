@@ -41,7 +41,7 @@ long do_mount(const char *dev_name, const char __user *dir_name,
 		((char *)data_page)[PAGE_SIZE - 1] = 0;
 
 	/* ... and get the mountpoint */
-	retval = user_path(dir_name, &path);
+	retval = user_path(dir_name, &path);/*已经找到了要挂载的文件夹的dentry和该dentry的mnt信息*/
 	if (retval)
 		return retval;
 
@@ -93,7 +93,7 @@ long do_mount(const char *dev_name, const char __user *dir_name,
 		retval = do_change_type(&path, flags);
 	else if (flags & MS_MOVE)
 		retval = do_move_mount(&path, dev_name);
-	else
+	else/*执行该路径*/
 		retval = do_new_mount(&path, type_page, flags, mnt_flags,
 				      dev_name, data_page);
 dput_out:
@@ -169,7 +169,7 @@ static int path_lookupat(int dfd, const char *name,
 	 */
 	err = path_init(dfd, name, flags, nd);
 	if (!err && !(flags & LOOKUP_PARENT)) {
-		err = lookup_last(nd, &path);
+		err = lookup_last(nd, &path);/*查找debug，该dentry的情况和kernel一样*/
 		while (err > 0) {
 			void *cookie;
 			struct path link = path;
@@ -806,11 +806,14 @@ struct mount *__lookup_mnt(struct vfsmount *mnt, struct dentry *dentry)
 	struct hlist_head *head = m_hash(mnt, dentry);
 	struct mount *p;
 	/*在该链表中查找sys dentry的struct mount结构
-	 *挂载点的dentry等于sys的dentry，挂载点也为父子关系，
+	 *挂载名称等于sys的dentry，挂载点也为父子关系，
 	 *默认sys文件系统的父struct mount为跟文件系统的struct mount，
-	 *我们从根文件系统开始查找，所遇mnt等于p->mnt_parent->mnt
+	 *我们从根文件系统开始查找，所以mnt等于p->mnt_parent->mnt
 	 */
 	hlist_for_each_entry_rcu(p, head, mnt_hash)
+		/* 我们是按照路径一层层递进查找，所以必有下面的等式成立
+		 *mnt是p的父文件系统的mnt信息，dentry是该文件系统下的dentry。
+		 */
 		if (&p->mnt_parent->mnt == mnt && p->mnt_mountpoint == dentry)
 			return p;
 	return NULL;
@@ -1317,5 +1320,473 @@ static void __d_instantiate(struct dentry *dentry, struct inode *inode)
 	dentry_rcuwalk_barrier(dentry);
 	spin_unlock(&dentry->d_lock);
 	fsnotify_d_instantiate(dentry, inode);
+}
+
+/*
+ * create a new mount for userspace and request it to be added into the
+ * namespace's tree
+ */
+/* fstype = "debugfs" flags = 0x8000 mnt_flags = 0x20 name = "none" data = NULL*/
+static int do_new_mount(struct path *path, const char *fstype, int flags,
+			int mnt_flags, const char *name, void *data)
+{
+	struct file_system_type *type;
+	struct user_namespace *user_ns = current->nsproxy->mnt_ns->user_ns;
+	struct vfsmount *mnt;
+	int err;
+
+	type = get_fs_type(fstype);
+
+	if (user_ns != &init_user_ns) {
+		if (!(type->fs_flags & FS_USERNS_MOUNT)) {
+			put_filesystem(type);
+			return -EPERM;
+		}
+		/* Only in special cases allow devices from mounts
+		 * created outside the initial user namespace.
+		 */
+		if (!(type->fs_flags & FS_USERNS_DEV_MOUNT)) {
+			flags |= MS_NODEV;
+			mnt_flags |= MNT_NODEV | MNT_LOCK_NODEV;
+		}
+	}
+
+	mnt = vfs_kern_mount(type, flags, name, data);
+
+	put_filesystem(type);
+
+	err = do_add_mount(real_mount(mnt), path, mnt_flags);
+	return err;
+}
+
+/* fstype = "debugfs" flags = 0x8000 name = "none" data = NULL*/
+struct vfsmount *
+vfs_kern_mount(struct file_system_type *type, int flags, const char *name, void *data)
+{
+	struct mount *mnt;
+	struct dentry *root;
+
+
+	mnt = alloc_vfsmnt(name);
+
+	if (flags & MS_KERNMOUNT)/*从用户挂载文件系统，没有MS_KERNMOUNT flag*/
+		mnt->mnt.mnt_flags = MNT_INTERNAL;
+
+	root = mount_fs(type, flags, name, data);
+
+	mnt->mnt.mnt_root = root;
+	mnt->mnt.mnt_sb = root->d_sb;
+	mnt->mnt_mountpoint = mnt->mnt.mnt_root;/*指向自己*/
+	mnt->mnt_parent = mnt;/*指向自己*/
+	lock_mount_hash();
+	/*添加到链表中*/
+	list_add_tail(&mnt->mnt_instance, &root->d_sb->s_mounts);
+	unlock_mount_hash();
+	return &mnt->mnt;
+}
+EXPORT_SYMBOL_GPL(vfs_kern_mount);
+
+static struct mount *alloc_vfsmnt(const char *name)
+{
+	struct mount *mnt = kmem_cache_zalloc(mnt_cache, GFP_KERNEL);
+	if (mnt) {
+		int err;
+
+		err = mnt_alloc_id(mnt);
+		if (err)
+			goto out_free_cache;
+
+		if (name) {
+			mnt->mnt_devname = kstrdup_const(name, GFP_KERNEL);/*mnt->mnt_devname = none*/
+			if (!mnt->mnt_devname)
+				goto out_free_id;
+		}
+
+#ifdef CONFIG_SMP
+		mnt->mnt_pcp = alloc_percpu(struct mnt_pcp);
+		if (!mnt->mnt_pcp)
+			goto out_free_devname;
+
+		this_cpu_add(mnt->mnt_pcp->mnt_count, 1);
+#else
+		mnt->mnt_count = 1;
+		mnt->mnt_writers = 0;
+#endif
+
+		INIT_HLIST_NODE(&mnt->mnt_hash);
+		INIT_LIST_HEAD(&mnt->mnt_child);
+		INIT_LIST_HEAD(&mnt->mnt_mounts);
+		INIT_LIST_HEAD(&mnt->mnt_list);
+		INIT_LIST_HEAD(&mnt->mnt_expire);
+		INIT_LIST_HEAD(&mnt->mnt_share);
+		INIT_LIST_HEAD(&mnt->mnt_slave_list);
+		INIT_LIST_HEAD(&mnt->mnt_slave);
+		INIT_HLIST_NODE(&mnt->mnt_mp_list);
+#ifdef CONFIG_FSNOTIFY
+		INIT_HLIST_HEAD(&mnt->mnt_fsnotify_marks);
+#endif
+		init_fs_pin(&mnt->mnt_umount, drop_mountpoint);
+	}
+	return mnt;
+}
+
+struct dentry *
+mount_fs(struct file_system_type *type, int flags, const char *name, void *data)
+{
+	struct dentry *root;
+	struct super_block *sb;
+	char *secdata = NULL;
+	int error = -ENOMEM;
+
+	/*调用debug_mount*/
+	root = type->mount(type, flags, name, data);
+	sb = root->d_sb;
+	sb->s_flags |= MS_BORN;
+
+	return root;
+}
+
+static struct dentry *debug_mount(struct file_system_type *fs_type,
+			int flags, const char *dev_name,
+			void *data)
+{
+	return mount_single(fs_type, flags, data, debug_fill_super);
+}
+
+struct dentry *mount_single(struct file_system_type *fs_type,
+	int flags, void *data,
+	int (*fill_super)(struct super_block *, void *, int))
+{
+	struct super_block *s;
+	int error;
+
+	s = sget(fs_type, compare_single, set_anon_super, flags, NULL);
+
+	if (!s->s_root) {/*s_root dentry也已经在kernel启动的时候创建了*/
+		error = fill_super(s, data, flags & MS_SILENT ? 1 : 0);
+		if (error) {
+			deactivate_locked_super(s);
+			return ERR_PTR(error);
+		}
+		s->s_flags |= MS_ACTIVE;
+	} else {
+		do_remount_sb(s, flags, data, 0);
+	}
+	return dget(s->s_root);/*s_root引用计数加1，并返回s_root*/
+}
+EXPORT_SYMBOL(mount_single);
+
+/**
+ *	sget	-	find or create a superblock
+ *	@type:	filesystem type superblock should belong to
+ *	@test:	comparison callback
+ *	@set:	setup callback
+ *	@flags:	mount flags
+ *	@data:	argument to each of them
+ */
+struct super_block *sget(struct file_system_type *type,
+			int (*test)(struct super_block *,void *),
+			int (*set)(struct super_block *,void *),
+			int flags,
+			void *data)
+{
+	struct super_block *s = NULL;
+	struct super_block *old;
+	int err;
+
+retry:
+	spin_lock(&sb_lock);
+	if (test) {
+		hlist_for_each_entry(old, &type->fs_supers, s_instances) {
+			if (!test(old, data))/*compare_single只返回1*/
+				continue;
+			if (!grab_super(old))
+				goto retry;
+			if (s) {
+				up_write(&s->s_umount);
+				destroy_super(s);
+				s = NULL;
+			}
+			/*以为在kernel中已经通过vfs_kern_mount挂载过debugfs,
+			 *所以已经创建了super block并且被放入到filesystem type的fs_suoers链表中
+			 *所以这里返回之前已经创建过的。
+			 */
+			return old;
+		}
+	}
+	if (!s) {
+		spin_unlock(&sb_lock);
+		s = alloc_super(type, flags);
+		if (!s)
+			return ERR_PTR(-ENOMEM);
+		goto retry;
+	}
+		
+	err = set(s, data);
+	if (err) {
+		spin_unlock(&sb_lock);
+		up_write(&s->s_umount);
+		destroy_super(s);
+		return ERR_PTR(err);
+	}
+	s->s_type = type;
+	strlcpy(s->s_id, type->name, sizeof(s->s_id));
+	list_add_tail(&s->s_list, &super_blocks);
+	hlist_add_head(&s->s_instances, &type->fs_supers);
+	spin_unlock(&sb_lock);
+	get_filesystem(type);
+	register_shrinker(&s->s_shrink);
+	return s;
+}
+
+EXPORT_SYMBOL(sget);
+
+static inline struct mount *real_mount(struct vfsmount *mnt)
+{
+	return container_of(mnt, struct mount, mnt);
+}
+
+/*
+ * add a mount into a namespace's mount tree
+ */
+static int do_add_mount(struct mount *newmnt, struct path *path, int mnt_flags)
+{
+	struct mountpoint *mp;
+	struct mount *parent;
+	int err;
+
+	mnt_flags &= ~MNT_INTERNAL_FLAGS;
+
+	mp = lock_mount(path);
+	/*返回path的 struct mount信息*/
+	parent = real_mount(path->mnt);
+	err = -EINVAL;
+	
+
+	/* Refuse the same filesystem on the same mount point */
+	err = -EBUSY;
+	if (path->mnt->mnt_sb == newmnt->mnt.mnt_sb &&
+	    path->mnt->mnt_root == path->dentry)
+		goto unlock;
+
+	err = -EINVAL;
+	if (d_is_symlink(newmnt->mnt.mnt_root))
+		goto unlock;
+
+	
+	newmnt->mnt.mnt_flags = mnt_flags;
+	err = graft_tree(newmnt, parent, mp);
+
+unlock:
+	unlock_mount(mp);
+	return err;
+}
+
+static struct mountpoint *lock_mount(struct path *path)
+{
+	struct vfsmount *mnt;
+	struct dentry *dentry = path->dentry;
+retry:
+	mutex_lock(&dentry->d_inode->i_mutex);
+	if (unlikely(cant_mount(dentry))) {
+		mutex_unlock(&dentry->d_inode->i_mutex);
+		return ERR_PTR(-ENOENT);
+	}
+	namespace_lock();
+	mnt = lookup_mnt(path);
+	if (likely(!mnt)) {
+		/*/sys/kerenl/debug没有挂载过，所以该函数返回NULL*/
+		struct mountpoint *mp = lookup_mountpoint(dentry);
+		if (!mp)
+			mp = new_mountpoint(dentry);
+		return mp;
+	}
+	namespace_unlock();
+	mutex_unlock(&path->dentry->d_inode->i_mutex);
+	path_put(path);
+	path->mnt = mnt;
+	dentry = path->dentry = dget(mnt->mnt_root);
+	goto retry;
+}
+
+/*
+ * lookup_mnt - Return the first child mount mounted at path
+ *
+ * "First" means first mounted chronologically.  If you create the
+ * following mounts:
+ *
+ * mount /dev/sda1 /mnt
+ * mount /dev/sda2 /mnt
+ * mount /dev/sda3 /mnt
+ *
+ * Then lookup_mnt() on the base /mnt dentry in the root mount will
+ * return successively the root dentry and vfsmount of /dev/sda1, then
+ * /dev/sda2, then /dev/sda3, then NULL.
+ *
+ * lookup_mnt takes a reference to the found vfsmount.
+ */
+
+struct vfsmount *lookup_mnt(struct path *path)
+{
+	struct mount *child_mnt;
+	struct vfsmount *m;
+	unsigned seq;
+
+	rcu_read_lock();
+	do {
+		seq = read_seqbegin(&mount_lock);
+		/*debug没有挂载过，所以在mount_hashtable缓存中是找不到的，所以返回null
+		 *该查找是查找debug这个挂载点上的第一个mnt
+		 */
+		child_mnt = __lookup_mnt(path->mnt, path->dentry);
+		m = child_mnt ? &child_mnt->mnt : NULL;
+	} while (!legitimize_mnt(m, seq));
+	rcu_read_unlock();
+	return m;
+}
+
+static struct mountpoint *lookup_mountpoint(struct dentry *dentry)
+{
+	struct hlist_head *chain = mp_hash(dentry);
+	struct mountpoint *mp;
+	/*在挂载点缓存 mountpoint_hashtable 哈希链表中查找*/
+	hlist_for_each_entry(mp, chain, m_hash) {
+		if (mp->m_dentry == dentry) {
+			/* might be worth a WARN_ON() */
+			if (d_unlinked(dentry))
+				return ERR_PTR(-ENOENT);
+			mp->m_count++;
+			return mp;
+		}
+	}
+	return NULL;/*debug dentry从来没有挂载过，所以返回null*/
+}
+
+static struct mountpoint *new_mountpoint(struct dentry *dentry)
+{
+	struct hlist_head *chain = mp_hash(dentry);
+	struct mountpoint *mp;
+	int ret;
+
+	mp = kmalloc(sizeof(struct mountpoint), GFP_KERNEL);
+
+	ret = d_set_mounted(dentry);
+
+	mp->m_dentry = dentry;
+	mp->m_count = 1;
+	/*将该mountpoint添加到 mountpoint_hashtable 哈希链表*/
+	hlist_add_head(&mp->m_hash, chain);
+	INIT_HLIST_HEAD(&mp->m_list);
+	return mp;
+}
+
+/*
+ * Called by mount code to set a mountpoint and check if the mountpoint is
+ * reachable (e.g. NFS can unhash a directory dentry and then the complete
+ * subtree can become unreachable).
+ *
+ * Only one of d_invalidate() and d_set_mounted() must succeed.  For
+ * this reason take rename_lock and d_lock on dentry and ancestors.
+ */
+/*对于根 dentry来说他的父dentry等于他自身，这里的根 dentry
+ *不是指系统的根dentry，而是每个文件系统的根dentry
+ */
+#define IS_ROOT(x) ((x) == (x)->d_parent)
+
+int d_set_mounted(struct dentry *dentry)
+{
+	struct dentry *p;
+	int ret = -ENOENT;
+	write_seqlock(&rename_lock);
+	for (p = dentry->d_parent; !IS_ROOT(p); p = p->d_parent) {
+		/* Need exclusion wrt. d_invalidate() */
+		spin_lock(&p->d_lock);
+		if (unlikely(d_unhashed(p))) {
+			spin_unlock(&p->d_lock);
+			goto out;
+		}
+		spin_unlock(&p->d_lock);
+	}
+	spin_lock(&dentry->d_lock);
+	if (!d_unlinked(dentry)) {
+		dentry->d_flags |= DCACHE_MOUNTED;/*表示该dentry已经挂载了文件系统*/
+		ret = 0;
+	}
+ 	spin_unlock(&dentry->d_lock);
+out:
+	write_sequnlock(&rename_lock);
+	return ret;
+}
+
+static int graft_tree(struct mount *mnt, struct mount *p, struct mountpoint *mp)
+{
+	if (mnt->mnt.mnt_sb->s_flags & MS_NOUSER)
+		return -EINVAL;
+
+	if (d_is_dir(mp->m_dentry) !=
+	      d_is_dir(mnt->mnt.mnt_root))
+		return -ENOTDIR;
+
+	return attach_recursive_mnt(mnt, p, mp, NULL);
+}
+
+static int attach_recursive_mnt(struct mount *source_mnt,
+			struct mount *dest_mnt,
+			struct mountpoint *dest_mp,
+			struct path *parent_path)
+{
+	HLIST_HEAD(tree_list);
+	struct mount *child, *p;
+	struct hlist_node *n;
+	int err;
+
+	if (IS_MNT_SHARED(dest_mnt)) {
+		
+	} else {
+		lock_mount_hash();
+	}
+	if (parent_path) {
+	
+	} else {
+		mnt_set_mountpoint(dest_mnt, dest_mp, source_mnt);
+		commit_tree(source_mnt, NULL);
+	}
+
+	hlist_for_each_entry_safe(child, n, &tree_list, mnt_hash) {
+		struct mount *q;
+		hlist_del_init(&child->mnt_hash);
+		q = __lookup_mnt_last(&child->mnt_parent->mnt,
+				      child->mnt_mountpoint);
+		commit_tree(child, q);
+	}
+	unlock_mount_hash();
+
+	return 0;
+
+ out_cleanup_ids:
+	while (!hlist_empty(&tree_list)) {
+		child = hlist_entry(tree_list.first, struct mount, mnt_hash);
+		umount_tree(child, 0);
+	}
+	unlock_mount_hash();
+	cleanup_group_ids(source_mnt, NULL);
+ out:
+	return err;
+}
+
+/*
+ * vfsmount lock must be held for write
+ */
+void mnt_set_mountpoint(struct mount *mnt,
+			struct mountpoint *mp,
+			struct mount *child_mnt)
+{
+	/*主要简历mount的父子关系*/
+	mp->m_count++;
+	mnt_add_count(mnt, 1);	/* essentially, that's mntget */
+	child_mnt->mnt_mountpoint = dget(mp->m_dentry);/*mnt_mountpoint = mp的dentry，既debug的dentry*/
+	child_mnt->mnt_parent = mnt;
+	child_mnt->mnt_mp = mp;
+	hlist_add_head(&child_mnt->mnt_mp_list, &mp->m_list);
 }
 
