@@ -6,7 +6,9 @@
 
 对上面的路径，对应的dentry为/,user,bin,vim
 
-debugfs文件系统会被挂载到/sys/kernel/debug/,再从之前sys文件系统已经被挂在到/sys。所以sys 是一个挂载点，在dentry_hashtable中也会有缓存
+debugfs文件系统会被挂载到/sys/kernel/debug/,再从之前sys文件系统已经被挂在到/sys。所以sys 是一个挂载点，在dentry_hashtable中也会有缓存。
+
+d_rehash(dentry);会把dentry添加到dentry_hashtable缓存中。
 
 #### struct mount
 

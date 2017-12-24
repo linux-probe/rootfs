@@ -1,3 +1,24 @@
+/*debugfs初始化会在/sys/kernel/下创建debug文件夹（这只是在kernfs中创建的，怎么和sysfs练习起来还需要分析）*/
+static int __init debugfs_init(void)
+{
+	int retval;
+
+	debug_kobj = kobject_create_and_add("debug", kernel_kobj);
+	if (!debug_kobj)
+		return -EINVAL;
+
+	retval = register_filesystem(&debug_fs_type);
+	if (retval)
+		kobject_put(debug_kobj);
+	else
+		debugfs_registered = true;
+
+	return retval;
+}
+core_initcall(debugfs_init);
+
+
+
 SYSCALL_DEFINE5(mount, char __user *, dev_name, char __user *, dir_name,
 		char __user *, type, unsigned long, flags, void __user *, data)
 {
