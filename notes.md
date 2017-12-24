@@ -117,6 +117,38 @@ simple_pin_fs会调用vfs_kern_mount，但是于从user空间调用mount命令�
 
 调用vfs_kern_mount之后，就已经分配了根super_block，并且会执行hlist_add_head(&s->s_instances, &type->fs_supers);将super_block的s_instances加入filesystem_type的哈希链表fs_supers中。后面在挂载的时候，检查已经存在就不用在分配。
 
+#### devtmpfs
 
+在kernel启动的过程中，kernel挂载了devtmpfs,但是在执行mount命令的时候看不到有该文件系统信息。
 
-   
+```c
+int __init devtmpfs_init(void)
+{
+	int err = register_filesystem(&dev_fs_type);
+
+	thread = kthread_run(devtmpfsd, &err, "kdevtmpfs");
+	if (!IS_ERR(thread)) {
+		wait_for_completion(&setup_done);
+	} else {
+	}
+
+	printk(KERN_INFO "devtmpfs: initialized\n");
+	return 0;
+}
+```
+
+```c
+static int devtmpfsd(void *p)
+{
+	char options[] = "mode=0755";
+	int *err = p;
+	*err = sys_unshare(CLONE_NEWNS);
+	*err = sys_mount("devtmpfs", "/", "devtmpfs", MS_SILENT, options);
+	sys_chdir("/.."); /* will traverse into overmounted root */
+	sys_chroot(".");
+	complete(&setup_done);
+	return 0;
+}
+```
+
+kernel起了一个名为kdevtmpfs的内核线程执行操作，线程的执行函数为devtmpfsd。在该函数中调用sys_mount进行挂载。**但是在挂载之前执行了一个sys_unshare(CLONE_NEWNS);该函数表示新的进程在一个新的命名空间中（namespace）。而mount命令查看的是当前进程的命名空间的挂载信息，所以看不到devtmpfs的挂载信息**。
